@@ -1,0 +1,9 @@
+/target
+
+# Stažené/vygenerované mpv soubory - velké binárky, každý si je udělá
+# lokálně přes vendor/mpv/make-lib.ps1 (viz README). Skript a README v
+# vendor/mpv/ zůstávají sledované.
+/vendor/mpv/*.dll
+/vendor/mpv/*.lib
+/vendor/mpv/*.exp
+/vendor/mpv/*.def
