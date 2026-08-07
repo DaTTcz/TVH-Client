@@ -4,8 +4,6 @@ Desktopový klient pro TVHeadend v Rustu (GUI: `egui`/`eframe`).
 
 Zatím **chybí** (další kolo):
 
-- [ ] EPG (název pořadu, co běží teď/potom) — záložka EPG je zatím jen
-      placeholder ("připravujeme")
 - [ ] Nahrávání (DVR) — záložka Nahrávky je zatím jen placeholder
 
 ## Aktualizace (GitHub Releases + self-update)
