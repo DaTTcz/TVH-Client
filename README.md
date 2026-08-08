@@ -11,6 +11,7 @@
   <a href="https://www.paypal.com/paypalme/DaTTcz">
     <img src="https://img.shields.io/badge/%E2%9D%A4%EF%B8%8F_Podpo%C5%99_projekt-PayPal-ffc439?style=for-the-badge&logo=paypal&logoColor=ffc439&labelColor=003087" alt="Podpořit přes PayPal">
   </a>
+  &nbsp;&nbsp;
   <a href="https://ko-fi.com/dattcz">
     <img src="https://img.shields.io/badge/%E2%98%95_Ko--fi-dattcz-ff5e5b?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Podpořit na Ko-fi">
   </a>
