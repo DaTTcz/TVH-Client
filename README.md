@@ -39,7 +39,7 @@
 
 Nejjednodušší cesta je hotový build ze
 [GitHub Releases](https://github.com/DaTTcz/TVH-Client/releases/latest) —
-stáhni `TVH-Client.exe` a `libmpv-2.dll` a dej je vedle sebe do stejné
+stáhni `TVH-Client.exe` a [libmpv-2.dll] (https://github.com/DaTTcz/TVH-Client/releases/download/v0.1.0/libmpv-2.dll) a dej je vedle sebe do stejné
 složky. Instalátor není potřeba, appka nic nezapisuje mimo svoji vlastní
 složku a `%APPDATA%\tvh-client\` (nastavení, cache log a přihlašovacích
 údajů).
