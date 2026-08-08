@@ -30,7 +30,7 @@
 - **Loga kanálů** cachovaná na disk (rychlý start, tichá aktualizace na
   pozadí, žádné blikání).
 - **Automatická aktualizace** — appka umí sama zkontrolovat i nainstalovat
-  novější verzi z GitHub Releases (viz [Aktualizace](#aktualizace) níž).
+  novější verzi z GitHub Releases.
 - **Klávesové zkratky** — `↑`/`↓` nebo `+`/`-` hlasitost, `PageUp`/
   `PageDown` (nebo `←`/`→` v EPG) předchozí/další kanál, `T`/`E`/`R`/`N`
   přepnutí na záložku TV/EPG/Nahrávky/Nastavení, `Esc` opustí fullscreen.
