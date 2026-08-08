@@ -7,6 +7,12 @@
   (<a href="https://github.com/emilk/egui">egui</a>/<a href="https://github.com/emilk/egui/tree/master/crates/eframe">eframe</a>).
 </p>
 
+<p align="center">
+  <a href="https://www.paypal.com/paypalme/DaTTcz">
+    <img src="https://img.shields.io/badge/PayPal-Podpo%C5%99%20projekt-0070ba?logo=paypal&logoColor=white" alt="Podpořit přes PayPal">
+  </a>
+</p>
+
 ---
 
 ## Co to umí
@@ -48,7 +54,7 @@ MSVC C runtime (`vcruntime140.dll`/`msvcp140.dll`) řešit nemusíš — je
 zabudovaný přímo v `.exe` (statické linkování), takže cílový PC nepotřebuje
 mít nainstalovaný Visual C++ Redistributable.
 
-Při prvním spuštění appka pošle do **Nastavení > Připojení** — zadej
+Při prvním spuštění tě appka pošle do **Nastavení > Připojení** — zadej
 adresu serveru (např. `192.168.0.10:9981`, `http://` se doplní samo),
 případně jméno/heslo, a klikni Připojit.
 
