@@ -1,6 +1,0 @@
-# Tells the MSVC linker where to find mpv.lib (see README.md "Video
-# playback (mpv) - Windows setup"). This only adds a library *search
-# path* for the linker - it does NOT redirect where cargo puts build
-# output (target/ stays where it was, as requested).
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-L", "native=vendor/mpv"]
