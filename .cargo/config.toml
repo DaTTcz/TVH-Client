@@ -1,0 +1,13 @@
+# Tells the MSVC linker where to find mpv.lib (see README.md "Video
+# playback (mpv) - Windows setup"). This only adds a library *search
+# path* for the linker - it does NOT redirect where cargo puts build
+# output (target/ stays where it was, as requested).
+#
+# `+crt-static` statically links the MSVC C runtime into tvh-client.exe,
+# so it doesn't need the Visual C++ Redistributable installed on other
+# PCs. libmpv-2.dll still links its own CRT dynamically - that's fine,
+# each module (exe/DLL) manages its own CRT instance on Windows, they
+# don't need to match as long as nothing passes raw CRT objects (FILE*,
+# malloc'd pointers, etc.) across the boundary, which we don't.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-L", "native=vendor/mpv", "-C", "target-feature=+crt-static"]
