@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://www.paypal.com/paypalme/DaTTcz">
-    <img src="https://img.shields.io/badge/PayPal-Podpo%C5%99%20projekt-0070ba?logo=paypal&logoColor=white" alt="Podpořit přes PayPal">
+    <img src="https://img.shields.io/badge/%E2%9D%A4%EF%B8%8F_Podpo%C5%99_tento_projekt-PayPal-ffdd00?style=for-the-badge&logo=paypal&logoColor=003087&labelColor=ffdd00" alt="Podpořit přes PayPal">
   </a>
 </p>
 
