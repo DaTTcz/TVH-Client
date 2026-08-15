@@ -89,6 +89,38 @@ fn draw_buffering_indicator(ui: &egui::Ui, rect: egui::Rect, pct: Option<i64>) {
     );
 }
 
+/// Ovládání hlasitosti (ikona podle úrovně + posuvník 0-100 s vypsaným
+/// procentem) - sdílené mezi TV a Nahrávky video overlayem
+/// (`draw_video_overlay`/`draw_recording_overlay`). `MpvPlayer::volume`/
+/// `set_volume` berou `&self`, takže na tohle stačí jen mpv handle, ne
+/// `&mut TvhApp` - vrací `egui::Response`, aby volající mohl po
+/// `response.drag_stopped()` uložit novou hodnotu do `Settings::volume`
+/// (viz volací místa) bez zapisování na disk při každém tiku tažení.
+fn draw_volume_control(ui: &mut egui::Ui, player: &MpvPlayer, slider_width: f32) -> egui::Response {
+    let mut volume = player.volume() as f32;
+    let icon = if volume <= 0.0 {
+        "🔇"
+    } else if volume < 50.0 {
+        "🔉"
+    } else {
+        "🔊"
+    };
+    ui.label(icon);
+    // `Slider` v téhle verzi egui nemá builder metodu pro šířku - nastaví
+    // se přes `spacing.slider_width` (starší, ale spolehlivější způsob,
+    // funguje napříč verzemi).
+    ui.spacing_mut().slider_width = slider_width;
+    let response = ui.add(
+        egui::Slider::new(&mut volume, 0.0..=100.0)
+            .suffix("%")
+            .fixed_decimals(0),
+    );
+    if response.changed() {
+        player.set_volume(volume as f64);
+    }
+    response
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum TopTab {
     Tv,
@@ -395,6 +427,13 @@ pub struct TvhApp {
     // visible - pushed forward whenever the mouse moves over the video;
     // `None`/expired means "hidden". See `VIDEO_CONTROLS_IDLE_TIMEOUT`.
     video_controls_until: Option<Instant>,
+    // Deadline until which the overlay is forced visible after a
+    // keyboard volume change (+/-, arrow keys), *regardless* of mouse
+    // position - without this, changing volume by keyboard while the
+    // mouse isn't sitting over the video would silently do nothing
+    // visible (see `adjust_volume`). OR'd into the same `show_controls`
+    // checks that use `video_controls_until`.
+    volume_osd_until: Option<Instant>,
     // Current mpv playback error (bad URL, unsupported format, network
     // timeout, ...), if any - see `MpvPlayer::poll_errors`. Shown as a
     // banner over the video instead of a silently-black area; cleared
@@ -436,6 +475,11 @@ impl TvhApp {
             Ok(p) => (Some(Arc::new(p)), None),
             Err(e) => (None, Some(e)),
         };
+        // Restore the volume the user left it at last time (see
+        // `Settings::volume`) - mpv itself always starts fresh at 100.
+        if let Some(player) = &player {
+            player.set_volume(settings.volume);
+        }
 
         let about_logo = logos::decode_and_load(
             &cc.egui_ctx,
@@ -476,6 +520,7 @@ impl TvhApp {
             recording_playback_started_at: None,
             paused: false,
             video_controls_until: None,
+            volume_osd_until: None,
             player_playback_error: None,
             update: UpdateState::default(),
             about_logo,
@@ -1033,11 +1078,21 @@ impl TvhApp {
     }
 
     /// Nudges mpv's volume (0-100 scale) by `delta` - no-op if mpv isn't
-    /// available.
-    fn adjust_volume(&self, delta: f64) {
+    /// available. Also forces the video overlay (which now shows the
+    /// volume slider, see `draw_volume_control`) briefly visible via
+    /// `volume_osd_until`, so a keyboard volume change is actually visible
+    /// even when the mouse isn't sitting over the video.
+    fn adjust_volume(&mut self, delta: f64) {
         if let Some(player) = &self.player {
             let current = player.volume();
             player.set_volume(current + delta);
+            self.volume_osd_until = Some(Instant::now() + VIDEO_CONTROLS_IDLE_TIMEOUT);
+            // Persisted so the next launch restores it - see
+            // `Settings::volume`. One keypress = one save, unlike
+            // dragging the overlay's slider (see `draw_volume_control`'s
+            // call sites), which only save once the drag ends.
+            self.settings.volume = player.volume();
+            let _ = self.settings.save();
         }
     }
 
@@ -1473,17 +1528,26 @@ impl TvhApp {
             if pointer_in_video && pointer_moved {
                 self.video_controls_until = Some(Instant::now() + VIDEO_CONTROLS_IDLE_TIMEOUT);
             }
-            let show_controls = pointer_in_video
-                && self
-                    .video_controls_until
-                    .is_some_and(|deadline| Instant::now() < deadline);
+            let volume_osd_active = self
+                .volume_osd_until
+                .is_some_and(|deadline| Instant::now() < deadline);
+            let show_controls = volume_osd_active
+                || (pointer_in_video
+                    && self
+                        .video_controls_until
+                        .is_some_and(|deadline| Instant::now() < deadline));
             if pointer_in_video {
                 if !show_controls {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                 }
+            }
+            if pointer_in_video || volume_osd_active {
                 // Keep re-checking the deadline even with no video
                 // playing (which would otherwise not repaint on its
-                // own once the pointer stops generating input events).
+                // own once the pointer stops generating input events) -
+                // also needed while `volume_osd_active` so the overlay a
+                // keyboard volume change forced open actually hides
+                // itself again once its deadline passes.
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             }
 
@@ -1629,10 +1693,16 @@ impl TvhApp {
             // +10 general padding/safety margin.
             num_lines * line_height + 14.0
         });
+        // Řádek s hlasitostí navíc, jen pokud vůbec máme mpv handle, co
+        // ovládat (`player_for_volume` - vlastní `Arc` klon, ať closure
+        // níž nemusí znovu sahat do `self.player` a řešit borrow).
+        let player_for_volume = self.player.clone();
+        const VOLUME_ROW_HEIGHT: f32 = 30.0;
+        let volume_extra = if player_for_volume.is_some() { VOLUME_ROW_HEIGHT } else { 0.0 };
         let panel_height = if current.is_some() {
-            118.0 + synopsis_extra_height
+            118.0 + synopsis_extra_height + volume_extra
         } else {
-            74.0
+            74.0 + volume_extra
         };
         let panel_rect = egui::Rect::from_min_size(
             egui::pos2(rect.left() + margin, rect.bottom() - margin - panel_height),
@@ -1684,6 +1754,21 @@ impl TvhApp {
                     }
                 });
             });
+
+            if let Some(player) = &player_for_volume {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    // Uložit až po puštění tažení, ne při každém `changed()`
+                    // tiku (viz `draw_volume_control` doc) - jinak by
+                    // jedno přetažení posuvníku zapsalo settings.json
+                    // desetkrát za sekundu.
+                    if draw_volume_control(ui, player, panel_width - 90.0).drag_stopped() {
+                        self.settings.volume = player.volume();
+                        let _ = self.settings.save();
+                    }
+                });
+            }
 
             ui.add_space(4.0);
             match current {
@@ -1853,14 +1938,20 @@ impl TvhApp {
             if pointer_in_video && pointer_moved {
                 self.video_controls_until = Some(Instant::now() + VIDEO_CONTROLS_IDLE_TIMEOUT);
             }
-            let show = pointer_in_video
-                && self
-                    .video_controls_until
-                    .is_some_and(|deadline| Instant::now() < deadline);
+            let volume_osd_active = self
+                .volume_osd_until
+                .is_some_and(|deadline| Instant::now() < deadline);
+            let show = volume_osd_active
+                || (pointer_in_video
+                    && self
+                        .video_controls_until
+                        .is_some_and(|deadline| Instant::now() < deadline));
             if pointer_in_video {
                 if !show {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                 }
+            }
+            if pointer_in_video || volume_osd_active {
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             }
             show
@@ -1971,8 +2062,10 @@ impl TvhApp {
         };
         let paused = self.paused;
 
+        let player_for_volume = self.player.clone();
+        const VOLUME_ROW_HEIGHT: f32 = 30.0;
         let margin = 12.0;
-        let panel_height = 46.0;
+        let panel_height = 46.0 + if player_for_volume.is_some() { VOLUME_ROW_HEIGHT } else { 0.0 };
         let panel_width = (rect.width() - margin * 2.0).min(560.0);
         let panel_rect = egui::Rect::from_min_size(
             egui::pos2(rect.left() + margin, rect.bottom() - margin - panel_height),
@@ -2003,6 +2096,21 @@ impl TvhApp {
                     }
                 });
             });
+
+            if let Some(player) = &player_for_volume {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    // Uložit až po puštění tažení, ne při každém `changed()`
+                    // tiku (viz `draw_volume_control` doc) - jinak by
+                    // jedno přetažení posuvníku zapsalo settings.json
+                    // desetkrát za sekundu.
+                    if draw_volume_control(ui, player, panel_width - 90.0).drag_stopped() {
+                        self.settings.volume = player.volume();
+                        let _ = self.settings.save();
+                    }
+                });
+            }
         });
 
         if toggle_pause {

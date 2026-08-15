@@ -32,7 +32,7 @@ pub struct ServerProfile {
     pub selected_tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub servers: Vec<ServerProfile>,
@@ -44,6 +44,31 @@ pub struct Settings {
     /// tab instead of asking every time (see `TvhApp::recordings_finished_list`).
     #[serde(default)]
     pub downloads_dir: String,
+    /// mpv's volume scale (0-100), restored at startup and saved back
+    /// whenever the user changes it (video overlay slider or keyboard
+    /// +/-/arrows - see `TvhApp::adjust_volume`) so it doesn't reset to
+    /// 100 every time the app is relaunched. Defaults to 100 (mpv's own
+    /// default) both for a brand new install and for an old
+    /// `settings.json` saved before this field existed - see
+    /// `default_volume`/the manual `Default` impl below (`#[derive(Default)]`
+    /// would otherwise zero-initialize it, i.e. start muted).
+    #[serde(default = "default_volume")]
+    pub volume: f64,
+}
+
+fn default_volume() -> f64 {
+    100.0
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            servers: Vec::new(),
+            primary_id: None,
+            downloads_dir: String::new(),
+            volume: default_volume(),
+        }
+    }
 }
 
 /// Old (kolo 1/2) single-server format - only used to migrate.
