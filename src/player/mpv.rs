@@ -120,7 +120,16 @@ impl MpvPlayer {
         // We draw the video ourselves via the render API - no separate
         // native window, no on-screen controller (OSC) from mpv itself.
         let _ = mpv.set_property("vo", "libmpv");
-        let _ = mpv.set_property("hwdec", "auto-safe");
+        // Softwarové dekódování, ne "auto-safe" (HW dekódování přes GPU) -
+        // diagnostický pokus kvůli blokovým/kostičkovým obrazovým
+        // artefaktům, co se objevovaly během přehrávání a nešly ničím
+        // (přepnutím kanálu, stop/play) odstranit - viz `render()`'s
+        // vlastní oprava výše (chyba vykreslení se už nezahazuje) a
+        // diskuze s Davidem. Typický projev vadného/nekompatibilního HW
+        // dekodéru na některých GPU/ovladačích. Nevýhoda: vyšší zátěž CPU
+        // než HW dekódování - pokud se ukáže jako problém (např. u HD
+        // kanálů na slabším CPU), je tohle první místo, kam se vrátit.
+        let _ = mpv.set_property("hwdec", "no");
         let _ = mpv.set_property("keep-open", "yes");
         let _ = mpv.set_property("osc", false);
 
@@ -259,7 +268,31 @@ impl MpvPlayer {
         // Render mpv's frame into our own dedicated off-screen target -
         // mpv always draws at (0, 0) of whatever framebuffer it's given,
         // which is correct here since this FBO is exactly video-sized.
-        let _ = self.render_ctx.render::<()>(t.fbo_id, width, height, true);
+        //
+        // The error case used to be silently swallowed (`let _ = ...`).
+        // That meant that if this call ever started failing mid-playback
+        // (bad GPU/driver state, lost context, ...), `render()` would
+        // just keep re-blitting whatever was already sitting in `t`'s
+        // texture from the last successful call, forever - the video
+        // would visibly freeze on one (possibly already-corrupted, e.g.
+        // a decode glitch caught mid-frame) image, and nothing later
+        // (changing channel, stop/play, ...) could ever fix it, because
+        // none of that touches this render target - only a resize
+        // previously forced it to be rebuilt. Now: surfaced through the
+        // same `last_error`/`poll_errors` the "Přehrávání selhalo" banner
+        // already reads, and the target is torn down so the *next* call
+        // rebuilds it from scratch instead of continuing to reuse
+        // whatever GPU state just failed.
+        if let Err(e) = self.render_ctx.render::<()>(t.fbo_id, width, height, true) {
+            *self.last_error.lock().unwrap() = Some(format!("Vykreslení snímku selhalo: {e}"));
+            if let Some(bad) = target.take() {
+                unsafe {
+                    gl.delete_framebuffer(bad.fbo);
+                    gl.delete_texture(bad.texture);
+                }
+            }
+            return;
+        }
 
         // ...then copy it into the real, shared framebuffer at the
         // sub-rect egui actually wants it in.
