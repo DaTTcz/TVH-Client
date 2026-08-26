@@ -121,14 +121,19 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 /// - see `TvhClient::dvr_urls`) to `dest`, creating parent directories as
 /// needed, streaming it in chunks (rather than buffering the whole file
 /// in memory first) so progress can be reported and `control` can pause/
-/// cancel mid-transfer. On cancel or any error, the partially-written
-/// file is removed rather than left behind half-finished.
+/// cancel mid-transfer.
+///
+/// `delete_on_failure` controls what happens to `dest` on cancel or
+/// error - `true` for the Nahrávky tab's "⬇ Stáhnout" (a half-finished
+/// file sitting in the user's downloads folder under a "finished" name
+/// would be confusing - clean it up).
 pub fn spawn_download(
     ctx: egui::Context,
     url: String,
     dest: PathBuf,
     control: Arc<DownloadControl>,
     tx: Sender<DownloadUpdate>,
+    delete_on_failure: bool,
 ) {
     std::thread::spawn(move || {
         enum Outcome {
@@ -190,13 +195,15 @@ pub fn spawn_download(
                 let _ = tx.send(DownloadUpdate::Done(path));
             }
             Ok(Outcome::Cancelled) => {
-                let _ = std::fs::remove_file(&dest);
+                if delete_on_failure {
+                    let _ = std::fs::remove_file(&dest);
+                }
                 let _ = tx.send(DownloadUpdate::Cancelled);
             }
             Err(e) => {
-                // Best-effort cleanup - a half-written file lying around
-                // under a "finished" name would be confusing.
-                let _ = std::fs::remove_file(&dest);
+                if delete_on_failure {
+                    let _ = std::fs::remove_file(&dest);
+                }
                 let _ = tx.send(DownloadUpdate::Error(e));
             }
         }
@@ -217,23 +224,6 @@ pub fn downloads_dir() -> PathBuf {
         return PathBuf::from(home).join("Videos").join("TVH Client Nahrávky");
     }
     PathBuf::from("TVH Client Nahrávky")
-}
-
-/// Where a recording gets temporarily buffered to before mpv ever sees
-/// it (Nahrávky tab's "▶ Přehrát") - the OS temp directory, not
-/// `downloads_dir`/`Settings::downloads_dir`, since these files are
-/// throwaway and deleted again as soon as playback stops or switches to
-/// something else (see `TvhApp::clear_recording_playback` in app.rs).
-///
-/// This buffering step exists because pointing mpv directly at
-/// TVHeadend's `dvrfile/<uuid>` URL was observed to just hang - a
-/// permanently black video area, no mpv error, no buffering-state signal
-/// either - on at least one real connection, even though the exact same
-/// URL downloads fine through this same `spawn_download`. Buffering to a
-/// local file first and only ever handing mpv that reuses the one
-/// download path already proven to work reliably.
-pub fn playback_cache_dir() -> PathBuf {
-    std::env::temp_dir().join("tvh-client-playback")
 }
 
 /// Opens `path` (a file or folder) in the OS file manager and, if it's a

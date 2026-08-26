@@ -232,6 +232,36 @@ impl MpvPlayer {
         let _ = self.mpv.set_property("volume", volume.clamp(0.0, 100.0));
     }
 
+    /// Total length of the currently-loaded file, in seconds - `None` if
+    /// nothing is loaded, or mpv hasn't opened the file enough yet to
+    /// know its length (e.g. right after `load()`). Used for the
+    /// Nahrávky tab's seek bar (`draw_seek_bar`) - live TV has no
+    /// duration, so that bar just never shows there.
+    pub fn duration(&self) -> Option<f64> {
+        self.mpv.get_property("duration").ok()
+    }
+
+    /// Current playback position, in seconds.
+    pub fn position(&self) -> Option<f64> {
+        self.mpv.get_property("time-pos").ok()
+    }
+
+    /// Seek to an absolute position, in seconds. Doesn't clamp against
+    /// `duration` here - mpv clamps to whatever it actually has.
+    pub fn seek_to(&self, seconds: f64) {
+        let _ = self.mpv.set_property("time-pos", seconds.max(0.0));
+    }
+
+    /// Seek relative to the current position, in seconds (negative =
+    /// backward) - the keyboard ←/→ shortcuts for recording playback
+    /// (`TvhApp`'s global key handler). Uses mpv's own `seek` command
+    /// with the `relative` flag rather than reading `position()` and
+    /// calling `seek_to()` ourselves, so mpv handles clamping to
+    /// `[0, duration]` directly instead of us having to.
+    pub fn seek_relative(&self, delta_seconds: f64) {
+        let _ = self.mpv.command("seek", &[&delta_seconds.to_string(), "relative"]);
+    }
+
     /// Render the current video frame and blit it into place at
     /// `(dst_x, dst_y)` (bottom-left origin, i.e. `glViewport`/
     /// `glBlitFramebuffer` convention - matches

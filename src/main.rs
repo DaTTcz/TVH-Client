@@ -7,6 +7,7 @@ mod app;
 mod epg;
 mod logos;
 mod player;
+mod recording_proxy;
 mod recordings;
 mod settings;
 mod tvh;

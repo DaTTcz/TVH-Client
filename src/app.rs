@@ -32,6 +32,7 @@
 use crate::epg;
 use crate::logos;
 use crate::player::MpvPlayer;
+use crate::recording_proxy;
 use crate::recordings::{self, DownloadControl, DownloadUpdate, RecordingsData};
 use crate::settings::{ServerProfile, Settings};
 use crate::tvh::{Channel, ChannelTag, DvrEntry, EpgEvent, ServerInfo, TvhClient};
@@ -119,6 +120,61 @@ fn draw_volume_control(ui: &mut egui::Ui, player: &MpvPlayer, slider_width: f32)
         player.set_volume(volume as f64);
     }
     response
+}
+
+/// Posuvník pro přetáčení nahrávky (jen Nahrávky tab - živé TV se
+/// přetáčet nedá) - aktuální pozice/celková délka jako "m:ss", celý
+/// rozsah 0..délka je vždy tažitelný. Vrací `Some(pozice v sekundách)`
+/// až po puštění tažení (`response.drag_stopped()`), ne při každém tiku
+/// - volající (`draw_recording_overlay`) pak zavolá `TvhApp::handle_seek`.
+fn draw_seek_bar(
+    ui: &mut egui::Ui,
+    player: &MpvPlayer,
+    known_duration: Option<f64>,
+    slider_width: f32,
+) -> Option<f64> {
+    // Prefer the recording's real, known-upfront duration (from
+    // TVHeadend's own metadata) over mpv's own `duration()` - for a
+    // still-downloading MPEG-TS file, mpv only knows about however much
+    // has been read so far, which would otherwise cap how far forward
+    // the bar (and thus seeking) could ever reach. See
+    // `TvhApp::recording_known_duration`'s doc comment.
+    let Some(position) = player.position() else {
+        return None;
+    };
+    let duration = match known_duration.filter(|&d| d > 0.0) {
+        Some(d) => d,
+        None => match player.duration() {
+            Some(d) if d > 0.0 => d,
+            _ => return None,
+        },
+    };
+    let mut pos = position.clamp(0.0, duration) as f32;
+
+    ui.label(format_hms(position));
+    ui.spacing_mut().slider_width = slider_width;
+    let response =
+        ui.add(egui::Slider::new(&mut pos, 0.0..=duration.max(0.01) as f32).show_value(false));
+    ui.label(format_hms(duration));
+
+    if response.drag_stopped() {
+        Some(pos as f64)
+    } else {
+        None
+    }
+}
+
+/// `125.0` (seconds) -> `"2:05"`, or `"1:02:05"` past an hour.
+fn format_hms(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -279,43 +335,21 @@ struct PlayingRecording {
     title: String,
 }
 
-/// A recording being downloaded to a local temp file before mpv ever
-/// sees it (`TvhApp::recording_buffer`) - see that field's doc comment
-/// for why. Reuses the exact same background-download machinery as the
-/// Nahrávky tab's "⬇ Stáhnout" button (`recordings::spawn_download`/
-/// `DownloadControl`), just writing to a throwaway cache path instead of
-/// the user's configured downloads folder.
-struct RecordingBuffer {
-    path: PathBuf,
-    downloaded: u64,
-    total: Option<u64>,
-    paused: bool,
-    // Set once `downloaded` first crosses `RECORDING_START_PLAYBACK_BYTES`
-    // (or the file finishes before that, whichever's first) and mpv has
-    // been `load()`ed - from then on the download just keeps filling in
-    // the rest in the background while playback has already started, see
-    // `draw_recording_video`.
-    loaded_into_player: bool,
-    control: Arc<DownloadControl>,
-    rx: Receiver<DownloadUpdate>,
-}
-
-/// How much of a recording to have buffered locally before handing it to
-/// mpv, rather than waiting for the whole (possibly several-gigabyte)
-/// file - enough for reliable MPEG-TS format detection, small enough
-/// that playback starts quickly even on a slow connection. The rest
-/// keeps downloading in the background afterward.
-const RECORDING_START_PLAYBACK_BYTES: u64 = 2 * 1024 * 1024;
-
-/// How long the "Načítání bufferu..." indicator stays up after a
-/// recording starts playing, before it hides itself (see
-/// `recording_playback_started_at`) - it reappears on its own if mpv
-/// later reports a genuine stall (`MpvPlayer::buffering_percent`), so
-/// this is just about not permanently cluttering the corner with "still
-/// downloading in the background" info nobody needs once playback is
-/// smoothly running.
-const RECORDING_BUFFER_INDICATOR_DURATION: Duration = Duration::from_secs(3);
-
+/// Recording playback (Nahrávky tab's "▶ Přehrát") goes through
+/// `recording_proxy` - a tiny local HTTP server (see that module) that
+/// relays ordinary Range requests to TVHeadend, so mpv seeks through it
+/// exactly the way it seeks through any other network video. Two earlier
+/// approaches were tried and abandoned here: pointing mpv straight at
+/// TVHeadend's URL (just hung, no error, no signal - some connection/
+/// protocol quirk between mpv and TVHeadend directly), and downloading to
+/// a local file that mpv read while it kept growing (works fine for
+/// straight-through playback, but seeking into not-yet-downloaded parts
+/// reproduces a long-standing, documented mpv limitation - mpv issue
+/// #6465, "mpv hangs when seeking on growing file", 15-20s hangs matching
+/// exactly what David saw). Routing everything through our own reqwest
+/// client (already proven reliable for downloads) and letting mpv talk
+/// plain, complete, Range-capable HTTP to *that* sidesteps both.
+///
 /// One recording currently downloading (Nahrávky tab's "⬇ Stáhnout") -
 /// keyed by `DvrEntry::uuid` in `TvhApp::downloads`. `downloaded`/`total`
 /// are updated from `DownloadUpdate::Progress` messages on `rx`;
@@ -394,34 +428,20 @@ pub struct TvhApp {
     // Set instead of `playing` when a recording (not a live channel) is
     // loaded from the Nahrávky tab - see `PlayingRecording`.
     playing_recording: Option<PlayingRecording>,
-    // Local playback buffer for a recording, from the moment "▶ Přehrát"
-    // starts downloading it until the whole file has arrived - `None`
-    // once fully downloaded (or nothing's buffering). Root cause this
-    // works around: pointing mpv directly at TVHeadend's `dvrfile/<uuid>`
-    // URL was observed to just hang - permanently black, no mpv error
-    // event, no `paused-for-cache` buffering state either - on at least
-    // one real connection, even though the exact same URL downloads fine
-    // via our own `reqwest`-based `recordings::spawn_download`. So
-    // recordings are instead buffered to a local temp file with that
-    // same, already-proven download path, and mpv only ever opens a
-    // local file - but (recordings are often several GB) mpv is handed
-    // that file as soon as `RECORDING_START_PLAYBACK_BYTES` has arrived,
-    // not after the whole thing - the rest keeps downloading in the
-    // background while playback has already started (`loaded_into_player`
-    // tracks which phase it's in). See `RecordingBuffer` and
-    // `draw_recording_video`.
-    recording_buffer: Option<RecordingBuffer>,
-    // Local temp file mpv is currently playing a recording from (once
-    // buffering finished) - kept so it can be deleted once playback
-    // stops or switches to something else, see `clear_recording_playback`.
-    recording_buffer_path: Option<PathBuf>,
-    // When mpv was `load()`ed for the recording currently playing - used
-    // to show the "Načítání bufferu..." indicator only briefly (see
-    // `RECORDING_BUFFER_INDICATOR_DURATION`) rather than for as long as
-    // the background download keeps running, which on a slow connection
-    // could otherwise be the entire runtime. `None` once nothing's
-    // playing this way (see `clear_recording_playback`).
-    recording_playback_started_at: Option<Instant>,
+    // The local relay server (see `recording_proxy` module doc) currently
+    // fronting TVHeadend for the recording playing from the Nahrávky
+    // tab's "▶ Přehrát" - `None` once nothing's playing this way (see
+    // `clear_recording_playback`). Dropping it (its `Drop` impl) stops
+    // the listener thread.
+    recording_proxy: Option<recording_proxy::RecordingProxy>,
+    // Total length of the currently playing recording, in seconds -
+    // computed once upfront from `DvrEntry::stop - start` (known from
+    // TVHeadend's own metadata, same numbers the Nahrávky list already
+    // shows as "16:05-17:00"), preferred over `MpvPlayer::duration()`
+    // (which needs mpv to have actually probed the stream first) so the
+    // seek bar shows the real full range from the very first frame. See
+    // `draw_seek_bar`.
+    recording_known_duration: Option<f64>,
     paused: bool,
     // Deadline until which the video overlay controls + cursor stay
     // visible - pushed forward whenever the mouse moves over the video;
@@ -515,9 +535,8 @@ impl TvhApp {
             player_error,
             playing: None,
             playing_recording: None,
-            recording_buffer: None,
-            recording_buffer_path: None,
-            recording_playback_started_at: None,
+            recording_proxy: None,
+            recording_known_duration: None,
             paused: false,
             video_controls_until: None,
             volume_osd_until: None,
@@ -814,98 +833,6 @@ impl TvhApp {
             self.downloads.remove(&uuid);
         }
 
-        // Local playback buffer for "▶ Přehrát" (see `recording_buffer`
-        // doc comment) - mpv gets `load()`ed as soon as
-        // `RECORDING_START_PLAYBACK_BYTES` has arrived (`start_playback`),
-        // not only once the whole (possibly several-gigabyte) file is
-        // done; the download keeps running in the background either way
-        // until `Done`. `buffer_finished` carries along whether playback
-        // had already started, so an error/cancel *after* that point
-        // (background fill interrupted) doesn't yank away something the
-        // user is already watching - only a failure before that point
-        // does.
-        let mut start_playback: Option<PathBuf> = None;
-        let mut buffer_finished: Option<(PathBuf, bool, Result<(), String>)> = None;
-        if let Some(buf) = &mut self.recording_buffer {
-            loop {
-                match buf.rx.try_recv() {
-                    Ok(DownloadUpdate::Progress { downloaded, total }) => {
-                        buf.downloaded = downloaded;
-                        buf.total = total;
-                        if !buf.loaded_into_player && downloaded >= RECORDING_START_PLAYBACK_BYTES {
-                            buf.loaded_into_player = true;
-                            start_playback = Some(buf.path.clone());
-                        }
-                    }
-                    Ok(DownloadUpdate::Done(_)) => {
-                        if !buf.loaded_into_player {
-                            // A recording shorter than the threshold -
-                            // finished before ever crossing it.
-                            buf.loaded_into_player = true;
-                            start_playback = Some(buf.path.clone());
-                        }
-                        buffer_finished = Some((buf.path.clone(), true, Ok(())));
-                        break;
-                    }
-                    Ok(DownloadUpdate::Cancelled) => {
-                        buffer_finished =
-                            Some((buf.path.clone(), buf.loaded_into_player, Err("Zrušeno.".to_string())));
-                        break;
-                    }
-                    Ok(DownloadUpdate::Error(e)) => {
-                        buffer_finished = Some((buf.path.clone(), buf.loaded_into_player, Err(e)));
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        buffer_finished = Some((
-                            buf.path.clone(),
-                            buf.loaded_into_player,
-                            Err("Spojení s vláknem bylo přerušeno.".to_string()),
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-        if let Some(path) = start_playback {
-            if let Some(player) = &self.player {
-                match player.load(&path.to_string_lossy()) {
-                    Ok(()) => self.recording_playback_started_at = Some(Instant::now()),
-                    Err(e) => self.player_playback_error = Some(e),
-                }
-            }
-        }
-        if let Some((path, was_playing, result)) = buffer_finished {
-            self.recording_buffer = None;
-            match result {
-                Ok(()) => {
-                    self.recording_buffer_path = Some(path);
-                }
-                Err(e) => {
-                    if was_playing {
-                        // Already watching the buffered part - report it
-                        // but don't yank playback away. `spawn_download`
-                        // does try to delete its temp file even on this
-                        // kind of error; on Windows that quietly fails
-                        // while mpv still has the file open for reading,
-                        // so what's already buffered normally keeps
-                        // playing regardless (not a guarantee, just how
-                        // NTFS file locking tends to behave here).
-                        self.recordings_message =
-                            Some(format!("Dostahování na pozadí přerušeno: {e}"));
-                        self.recording_buffer_path = Some(path);
-                    } else {
-                        // `spawn_download` already deletes the partial/
-                        // cancelled temp file itself here - no separate
-                        // cleanup needed.
-                        self.recordings_message = Some(format!("Načtení nahrávky selhalo: {e}"));
-                        self.playing_recording = None;
-                    }
-                }
-            }
-        }
-
         // Zrušit/Smazat (upcoming cancel, finished/failed remove, autorec
         // delete) - all share `action_rx` since they only need a
         // success/failure signal before reloading the lists.
@@ -955,6 +882,7 @@ impl TvhApp {
                 }
             }
         }
+
     }
 
     /// Fires a quick write-only DVR action (cancel/remove/autorec-delete)
@@ -1041,19 +969,13 @@ impl TvhApp {
         }
     }
 
-    /// Cancels a recording's local playback buffer if one's still
-    /// downloading, and deletes its temp file whether it finished or
-    /// not - shared cleanup between starting a different recording,
-    /// switching to a live channel, and "✕ Zavřít". See
-    /// `recording_buffer`/`recording_buffer_path`.
+    /// Stops the local relay proxy (if a recording was playing through
+    /// one - see `recording_proxy`), dropping it (its `Drop` impl stops
+    /// the listener thread) - shared cleanup between starting a different
+    /// recording, switching to a live channel, and "✕ Zavřít".
     fn clear_recording_playback(&mut self) {
-        if let Some(buf) = self.recording_buffer.take() {
-            buf.control.cancel();
-        }
-        if let Some(path) = self.recording_buffer_path.take() {
-            let _ = std::fs::remove_file(path);
-        }
-        self.recording_playback_started_at = None;
+        self.recording_proxy = None;
+        self.recording_known_duration = None;
     }
 
     fn stop_playback(&mut self) {
@@ -1375,22 +1297,41 @@ impl TvhApp {
                                     // Name cell also carries what's currently
                                     // playing (title + a thin progress bar) when
                                     // EPG data is available for this channel.
+                                    // Channel name and programme title used to
+                                    // both render in very similar shades of gray
+                                    // (plain `label`/`GRAY` text) and blended
+                                    // together at a glance - now the name is
+                                    // always bold/bright (accented when this is
+                                    // the playing channel) and the programme
+                                    // title is deliberately smaller/dimmer, so
+                                    // the two read as a clear two-level
+                                    // hierarchy instead of one gray blob.
                                     let name_resp = ui
                                         .vertical(|ui| {
-                                            if selected {
-                                                ui.strong(ch.name.clone());
+                                            let name_color = if selected {
+                                                egui::Color32::from_rgb(120, 190, 255)
                                             } else {
-                                                ui.label(ch.name.clone());
-                                            }
+                                                egui::Color32::WHITE
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(ch.name.clone())
+                                                    .color(name_color)
+                                                    .strong(),
+                                            );
                                             if let Some(events) = self.epg.get(&ch.channel_id) {
                                                 let (current, next) =
                                                     epg::current_and_next(events, now);
                                                 if let Some(ev) = current {
                                                     let epg_resp = ui
                                                         .vertical(|ui| {
-                                                            ui.colored_label(
-                                                                egui::Color32::GRAY,
-                                                                ev.title.clone(),
+                                                            ui.label(
+                                                                egui::RichText::new(
+                                                                    ev.title.clone(),
+                                                                )
+                                                                .color(egui::Color32::from_gray(
+                                                                    145,
+                                                                ))
+                                                                .size(12.0),
                                                             );
                                                             ui.add(
                                                                 egui::ProgressBar::new(
@@ -1868,70 +1809,6 @@ impl TvhApp {
     fn draw_recording_video(&mut self, ui: &mut egui::Ui, rect: egui::Rect, fullscreen: bool) {
         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
 
-        // Still filling the *initial* local playback buffer (below
-        // `RECORDING_START_PLAYBACK_BYTES`) - show real, known-accurate
-        // progress (same idea as the Nahrávky list's own download
-        // progress bar) instead of anything video-shaped; mpv hasn't
-        // been given anything to play yet. Once past that point,
-        // `loaded_into_player` is set and this falls through to normal
-        // video rendering below - the rest keeps downloading in the
-        // background (see the small indicator inside the `have_video`
-        // branch further down). See `recording_buffer`.
-        let still_filling_initial_buffer =
-            self.recording_buffer.as_ref().is_some_and(|b| !b.loaded_into_player);
-        if still_filling_initial_buffer {
-            let buf = self.recording_buffer.as_ref().expect("checked above");
-            let downloaded = buf.downloaded;
-            let total = buf.total;
-            let paused = buf.paused;
-            let fraction = total
-                .filter(|&t| t > 0)
-                .map(|t| (downloaded as f32 / t as f32).clamp(0.0, 1.0));
-            let text = match total {
-                Some(t) => format!(
-                    "{} / {}",
-                    recordings::human_size(downloaded as i64),
-                    recordings::human_size(t as i64)
-                ),
-                None => recordings::human_size(downloaded as i64),
-            };
-            let box_width = (rect.width() - 40.0).min(300.0);
-            let box_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(box_width, 92.0));
-            let mut toggle_pause = false;
-            let mut cancel = false;
-            ui.scope_builder(egui::UiBuilder::new().max_rect(box_rect), |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.colored_label(egui::Color32::WHITE, "Ukládám do vyrovnávací paměti...");
-                    ui.add_space(6.0);
-                    ui.add(
-                        egui::ProgressBar::new(fraction.unwrap_or(0.0))
-                            .desired_width(box_width)
-                            .text(text),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let label = if paused { "▶ Pokračovat" } else { "⏸ Pauza" };
-                        if ui.small_button(label).clicked() {
-                            toggle_pause = true;
-                        }
-                        if ui.small_button("✕ Zrušit").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            });
-            if toggle_pause {
-                if let Some(buf) = &mut self.recording_buffer {
-                    buf.paused = !buf.paused;
-                    buf.control.set_paused(buf.paused);
-                }
-            }
-            if cancel {
-                self.stop_recording_playback(ui.ctx());
-            }
-            return;
-        }
-
         let show_controls = if fullscreen {
             let pointer_in_video = ui.rect_contains_pointer(rect);
             let pointer_moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
@@ -1961,35 +1838,12 @@ impl TvhApp {
 
         let have_video = self.player.is_some() && self.playing_recording.is_some();
         if have_video {
-            // While the background download (past the initial threshold,
-            // see `RECORDING_START_PLAYBACK_BYTES`) is still filling in
-            // the rest of the file, show *our own* accurate percentage
-            // rather than mpv's - once mpv is reading a local file, its
-            // own `paused-for-cache` essentially never fires the way it
-            // does for a real network stream. Read before the `.clone()`
-            // below moves a copy into the paint callback closure.
-            //
-            // Our own background-fill percentage is only shown briefly
-            // after playback starts (`RECORDING_BUFFER_INDICATOR_DURATION`)
-            // - past that it'd otherwise just sit there for as long as
-            // the background download keeps running, which on a slow
-            // connection could be the whole runtime. A genuine mpv stall
-            // (`buffering_percent`) always takes priority and always
-            // shows, however - that's an actual "playback caught up to
-            // what's downloaded" signal, not just informational.
-            let own_fill_pct = self.recording_buffer.as_ref().and_then(|b| {
-                b.total
-                    .filter(|&t| t > 0)
-                    .map(|t| ((b.downloaded as f64 / t as f64) * 100.0).clamp(0.0, 100.0) as i64)
-            });
-            let recently_started = self
-                .recording_playback_started_at
-                .is_some_and(|t| t.elapsed() < RECORDING_BUFFER_INDICATOR_DURATION);
-            let buffering_pct = self
-                .player
-                .as_ref()
-                .and_then(|p| p.buffering_percent())
-                .or_else(|| own_fill_pct.filter(|_| recently_started));
+            // Recording playback now goes through `recording_proxy`, an
+            // ordinary (local) HTTP source as far as mpv's concerned - so
+            // its own `paused-for-cache`/`buffering_percent` works here
+            // exactly like it already does for live TV, no separate
+            // "our own accurate percentage" tracking needed anymore.
+            let buffering_pct = self.player.as_ref().and_then(|p| p.buffering_percent());
             let player = self.player.clone().unwrap();
             let callback = egui::PaintCallback {
                 rect,
@@ -2064,8 +1918,19 @@ impl TvhApp {
 
         let player_for_volume = self.player.clone();
         const VOLUME_ROW_HEIGHT: f32 = 30.0;
+        const SEEK_ROW_HEIGHT: f32 = 26.0;
         let margin = 12.0;
-        let panel_height = 46.0 + if player_for_volume.is_some() { VOLUME_ROW_HEIGHT } else { 0.0 };
+
+        let known_duration = self.recording_known_duration;
+        let has_seek = player_for_volume.as_ref().is_some_and(|p| {
+            p.position().is_some()
+                && (known_duration.is_some_and(|d| d > 0.0)
+                    || p.duration().is_some_and(|d| d > 0.0))
+        });
+
+        let panel_height = 46.0
+            + if player_for_volume.is_some() { VOLUME_ROW_HEIGHT } else { 0.0 }
+            + if has_seek { SEEK_ROW_HEIGHT } else { 0.0 };
         let panel_width = (rect.width() - margin * 2.0).min(560.0);
         let panel_rect = egui::Rect::from_min_size(
             egui::pos2(rect.left() + margin, rect.bottom() - margin - panel_height),
@@ -2076,6 +1941,7 @@ impl TvhApp {
 
         let mut toggle_pause = false;
         let mut do_stop = false;
+        let mut seek_target: Option<f64> = None;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(panel_rect), |ui| {
             ui.add_space(6.0);
@@ -2096,6 +1962,16 @@ impl TvhApp {
                     }
                 });
             });
+
+            if has_seek {
+                if let Some(player) = &player_for_volume {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        seek_target = draw_seek_bar(ui, player, known_duration, panel_width - 110.0);
+                    });
+                }
+            }
 
             if let Some(player) = &player_for_volume {
                 ui.add_space(2.0);
@@ -2121,6 +1997,23 @@ impl TvhApp {
         }
         if do_stop {
             self.stop_recording_playback(ui.ctx());
+        }
+        if let Some(target) = seek_target {
+            let ctx = ui.ctx().clone();
+            self.handle_seek(&ctx, target);
+        }
+    }
+
+    /// Handles the seek bar (`draw_seek_bar`) being released at
+    /// `target_seconds`. Recording playback goes through
+    /// `recording_proxy` now, so this is just `MpvPlayer::seek_to` -
+    /// mpv/ffmpeg issues whatever new HTTP Range request it needs on its
+    /// own, the same way it already does for any other seekable network
+    /// video. No more manual byte-offset bookkeeping - see
+    /// `recording_proxy`'s module doc for why that approach was dropped.
+    fn handle_seek(&mut self, _ctx: &egui::Context, target_seconds: f64) {
+        if let Some(player) = &self.player {
+            player.seek_to(target_seconds);
         }
     }
 
@@ -2749,6 +2642,7 @@ impl TvhApp {
                                         dest,
                                         control.clone(),
                                         tx,
+                                        true,
                                     );
                                     self.downloads.insert(
                                         entry.uuid.clone(),
@@ -2764,14 +2658,6 @@ impl TvhApp {
                             }
                             if ui.button("▶ Přehrát").clicked() {
                                 if self.player.is_some() {
-                                    // Buffer to a local temp file, handing
-                                    // it to mpv as soon as enough has
-                                    // arrived (not the whole thing - see
-                                    // `recording_buffer` doc comment for
-                                    // why buffering happens at all here).
-                                    if let Some(player) = &self.player {
-                                        let _ = player.stop();
-                                    }
                                     self.clear_recording_playback();
                                     self.playing = None;
                                     self.paused = false;
@@ -2782,27 +2668,33 @@ impl TvhApp {
                                     self.video_controls_until =
                                         Some(Instant::now() + VIDEO_CONTROLS_IDLE_TIMEOUT);
 
-                                    let dest = recordings::playback_cache_dir().join(
-                                        recordings::safe_filename(&entry.disp_title, &entry.filename),
-                                    );
-                                    let control = DownloadControl::new();
-                                    let (tx, rx) = std::sync::mpsc::channel();
-                                    recordings::spawn_download(
-                                        ui.ctx().clone(),
-                                        url.clone(),
-                                        dest.clone(),
-                                        control.clone(),
-                                        tx,
-                                    );
-                                    self.recording_buffer = Some(RecordingBuffer {
-                                        path: dest,
-                                        downloaded: 0,
-                                        total: None,
-                                        paused: false,
-                                        loaded_into_player: false,
-                                        control,
-                                        rx,
-                                    });
+                                    // Known upfront from TVHeadend's own
+                                    // metadata - see `recording_known_duration`
+                                    // doc comment for why this (not mpv's
+                                    // own `duration()`) drives the seek bar.
+                                    let dur = entry.stop - entry.start;
+                                    self.recording_known_duration =
+                                        if dur > 0 { Some(dur as f64) } else { None };
+
+                                    // See `recording_proxy` module doc for
+                                    // why mpv gets pointed at our own
+                                    // local relay instead of TVHeadend's
+                                    // URL directly.
+                                    match recording_proxy::spawn(url.clone()) {
+                                        Ok(proxy) => {
+                                            if let Some(player) = &self.player {
+                                                if let Err(e) = player.load(&proxy.url()) {
+                                                    self.player_playback_error = Some(e);
+                                                }
+                                            }
+                                            self.recording_proxy = Some(proxy);
+                                        }
+                                        Err(e) => {
+                                            self.player_playback_error = Some(format!(
+                                                "Nepodařilo se spustit lokální proxy: {e}"
+                                            ));
+                                        }
+                                    }
                                 } else {
                                     // No embedded mpv (init failed at
                                     // startup) - fall back to whatever
@@ -3582,6 +3474,26 @@ impl eframe::App for TvhApp {
                     }
                     if i.key_pressed(egui::Key::PageDown) {
                         self.select_relative_channel(1);
+                    }
+                    // Seek ±10s - only meaningful for a recording (live
+                    // TV has no seekable position), so gated on
+                    // `playing_recording` rather than being global like
+                    // volume above.
+                    if self.playing_recording.is_some() {
+                        if i.key_pressed(egui::Key::ArrowLeft) {
+                            if let Some(player) = &self.player {
+                                player.seek_relative(-10.0);
+                            }
+                            self.video_controls_until =
+                                Some(Instant::now() + VIDEO_CONTROLS_IDLE_TIMEOUT);
+                        }
+                        if i.key_pressed(egui::Key::ArrowRight) {
+                            if let Some(player) = &self.player {
+                                player.seek_relative(10.0);
+                            }
+                            self.video_controls_until =
+                                Some(Instant::now() + VIDEO_CONTROLS_IDLE_TIMEOUT);
+                        }
                     }
                 }
             });
