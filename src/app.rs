@@ -122,16 +122,36 @@ fn draw_volume_control(ui: &mut egui::Ui, player: &MpvPlayer, slider_width: f32)
     response
 }
 
-/// Posuvník pro přetáčení nahrávky (jen Nahrávky tab - živé TV se
-/// přetáčet nedá) - aktuální pozice/celková délka jako "m:ss", celý
-/// rozsah 0..délka je vždy tažitelný. Vrací `Some(pozice v sekundách)`
-/// až po puštění tažení (`response.drag_stopped()`), ne při každém tiku
-/// - volající (`draw_recording_overlay`) pak zavolá `TvhApp::handle_seek`.
+/// Posuvník pro přetáčení - u nahrávky (Nahrávky tab) i timeshift bufferu
+/// živého vysílání (TV tab) - aktuální pozice/celková délka jako "m:ss",
+/// celý rozsah 0..délka je vždy tažitelný. Vrací `Some(pozice v
+/// sekundách, 0-based vůči `position_offset`)` až po puštění tažení
+/// (`response.drag_stopped()`), ne při každém tiku - volající
+/// (`draw_recording_overlay`/`draw_video_overlay`) pak přičte
+/// `position_offset` zpátky a zavolá `TvhApp::handle_seek`.
+///
+/// `position_offset` posouvá mpv's raw `position()` tak, aby "0" na baru
+/// odpovídalo začátku toho, co zrovna zobrazujeme - `0.0` pro nahrávku
+/// (`player.position()` už tam je 0-based), `TvhApp::live_seek_start` pro
+/// živé vysílání (mpv's `position()` pro živý kanál není zaručeně 0 od
+/// startu přehrávání).
+///
+/// `highlight_ahead` mění, která část pruhu se obarví (`TIMESHIFT_COLOR`
+/// u volajícího) - `false` (nahrávka) obarví 0..pozice - "kolik už je
+/// přehráno", vestavěné chování egui `Slider::trailing_fill`. `true`
+/// (živé vysílání) obarví naopak pozice..délka - podle Davidova zadání
+/// "timeshiftová část" je ten kus MEZI aktuální pozicí a živým okrajem
+/// (`TvhApp::live_seek_far_edge`), tedy to, o co jste se zpozdili za
+/// živým vysíláním (typicky vzniklo pauzou) - ne to, co už bylo
+/// přehráno. `Slider::trailing_fill` umí obarvit jen 0..pozice, takže
+/// tenhle případ dokreslujeme ručně přes `ui.painter()`.
 fn draw_seek_bar(
     ui: &mut egui::Ui,
     player: &MpvPlayer,
     known_duration: Option<f64>,
+    position_offset: f64,
     slider_width: f32,
+    highlight_ahead: bool,
 ) -> Option<f64> {
     // Prefer the recording's real, known-upfront duration (from
     // TVHeadend's own metadata) over mpv's own `duration()` - for a
@@ -139,9 +159,10 @@ fn draw_seek_bar(
     // has been read so far, which would otherwise cap how far forward
     // the bar (and thus seeking) could ever reach. See
     // `TvhApp::recording_known_duration`'s doc comment.
-    let Some(position) = player.position() else {
+    let Some(raw_position) = player.position() else {
         return None;
     };
+    let position = (raw_position - position_offset).max(0.0);
     let duration = match known_duration.filter(|&d| d > 0.0) {
         Some(d) => d,
         None => match player.duration() {
@@ -153,8 +174,37 @@ fn draw_seek_bar(
 
     ui.label(format_hms(position));
     ui.spacing_mut().slider_width = slider_width;
-    let response =
-        ui.add(egui::Slider::new(&mut pos, 0.0..=duration.max(0.01) as f32).show_value(false));
+    // `trailing_fill` - bez něj Slider kreslí jen tenký track a puntík,
+    // žádný barevný pruh - takže by `visuals.selection.bg_fill`
+    // (nastavené voláním výš - viz `TIMESHIFT_COLOR` u živého vysílání)
+    // neměl kde se vůbec projevit. Pro `highlight_ahead` (živé vysílání)
+    // to naopak vypneme - ten obarvuje opačnou polovinu pruhu ručně, viz
+    // níže.
+    let response = ui.add(
+        egui::Slider::new(&mut pos, 0.0..=duration.max(0.01) as f32)
+            .show_value(false)
+            .trailing_fill(!highlight_ahead),
+    );
+    if highlight_ahead {
+        // `pozice..délka` obarvený `TIMESHIFT_COLOR` (nastaveno voláním
+        // výš přes `visuals_mut().selection.bg_fill`, přečteme si ho
+        // zpátky přes `ui.visuals()`) - dokreslený přes track/puntík,
+        // vykreslený `ui.add` výš, jako tenký pruh v jeho vertikálním
+        // středu, takže puntík zůstane vidět nad/kolem něj, ne úplně
+        // zakrytý.
+        let fraction = (pos / duration.max(0.01) as f32).clamp(0.0, 1.0);
+        let track = response.rect;
+        let highlight_left = track.left() + track.width() * fraction;
+        if highlight_left < track.right() {
+            let strip_half_height = 2.5;
+            let highlight_rect = egui::Rect::from_min_max(
+                egui::pos2(highlight_left, track.center().y - strip_half_height),
+                egui::pos2(track.right(), track.center().y + strip_half_height),
+            );
+            ui.painter()
+                .rect_filled(highlight_rect, 2.0, ui.visuals().selection.bg_fill);
+        }
+    }
     ui.label(format_hms(duration));
 
     if response.drag_stopped() {
@@ -163,6 +213,13 @@ fn draw_seek_bar(
         None
     }
 }
+
+/// Slider fill color for the live-TV timeshift seek bar
+/// (`draw_video_overlay`) - amber, distinct from the default blue used
+/// for a recording's seek bar (`draw_recording_overlay`), so it's
+/// visually obvious this bar represents a timeshift buffer rather than a
+/// fixed-length video.
+const TIMESHIFT_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 160, 60);
 
 /// `125.0` (seconds) -> `"2:05"`, or `"1:02:05"` past an hour.
 fn format_hms(seconds: f64) -> String {
@@ -442,6 +499,27 @@ pub struct TvhApp {
     // seek bar shows the real full range from the very first frame. See
     // `draw_seek_bar`.
     recording_known_duration: Option<f64>,
+    // `player.position()` at the moment the currently-playing live
+    // channel's stream loaded - the "0" reference point for the live
+    // timeshift seek bar (`draw_video_overlay`), since mpv's raw
+    // position for a live channel isn't guaranteed to start at exactly
+    // 0. `None` until the first `position()` reading after `load()`
+    // succeeds (position isn't available the very first frame or two -
+    // `load()` is async), and reset to `None` on channel switch/stop,
+    // mirroring TVHeadend deleting its own server-side timeshift buffer
+    // when the subscription that was holding it goes away.
+    live_seek_start: Option<f64>,
+    // How far into the current channel's timeshift buffer we can
+    // currently seek, 0-based against `live_seek_start` - i.e. the seek
+    // bar's upper bound. Updated every frame from `position() +
+    // demuxer_cache_duration()` (see that method's doc comment), but
+    // only ever grows (`.max()`), never shrinks - `demuxer-cache-
+    // duration` is measured *ahead of the current read position*, so it
+    // swings around a lot as you seek backward/forward within an
+    // already-cached region; a seek bar whose far end kept jumping
+    // around would be more confusing than useful. Reset to `0.0`
+    // alongside `live_seek_start`.
+    live_seek_far_edge: f64,
     paused: bool,
     // Deadline until which the video overlay controls + cursor stay
     // visible - pushed forward whenever the mouse moves over the video;
@@ -537,6 +615,8 @@ impl TvhApp {
             playing_recording: None,
             recording_proxy: None,
             recording_known_duration: None,
+            live_seek_start: None,
+            live_seek_far_edge: 0.0,
             paused: false,
             video_controls_until: None,
             volume_osd_until: None,
@@ -940,6 +1020,11 @@ impl TvhApp {
                 self.playing_recording = None;
                 self.paused = false;
                 self.clear_recording_playback();
+                // New subscription on the server = a fresh (empty)
+                // timeshift buffer there, so our own tracked baseline/
+                // range for the old one is stale - see `live_seek_start`.
+                self.live_seek_start = None;
+                self.live_seek_far_edge = 0.0;
             }
             Err(e) => self.error = Some(e),
         }
@@ -984,6 +1069,10 @@ impl TvhApp {
         }
         self.playing = None;
         self.paused = false;
+        // TVHeadend drops its server-side timeshift buffer once the
+        // subscription behind "⏹" ends - drop our own tracked one too.
+        self.live_seek_start = None;
+        self.live_seek_far_edge = 0.0;
     }
 
     /// Move the selection by `delta` positions in `self.channels`
@@ -1591,6 +1680,24 @@ impl TvhApp {
         };
         let is_playing_this = self.playing == Some(i);
         let paused = self.paused;
+
+        // Capture/advance the timeshift-buffer tracking (see
+        // `live_seek_start`/`live_seek_far_edge`'s doc comments) every
+        // frame this channel is the one actually loaded into mpv -
+        // `position()` may not be available for a frame or two right
+        // after `load()`, hence the lazy `get_or_insert` rather than
+        // capturing it once inside `select_channel` itself.
+        if is_playing_this {
+            if let Some(player) = &self.player {
+                if let Some(pos) = player.position() {
+                    let start = *self.live_seek_start.get_or_insert(pos);
+                    let offset = (pos - start).max(0.0);
+                    let cache_ahead = player.demuxer_cache_duration().unwrap_or(0.0).max(0.0);
+                    self.live_seek_far_edge = self.live_seek_far_edge.max(offset + cache_ahead);
+                }
+            }
+        }
+
         let now = epg::now_unix();
         // Owned copy, not a borrow of `self.epg` - keeps the borrow from
         // living into the button-click handling below, which needs
@@ -1639,11 +1746,21 @@ impl TvhApp {
         // níž nemusí znovu sahat do `self.player` a řešit borrow).
         let player_for_volume = self.player.clone();
         const VOLUME_ROW_HEIGHT: f32 = 30.0;
+        const SEEK_ROW_HEIGHT: f32 = 26.0;
         let volume_extra = if player_for_volume.is_some() { VOLUME_ROW_HEIGHT } else { 0.0 };
+        // Timeshift seek bar only makes sense once we actually have a
+        // captured baseline and *some* buffered range to move around in
+        // - a couple of seconds' worth of normal read-ahead cache would
+        // make for a pointless, barely-draggable sliver of a bar.
+        const LIVE_SEEK_MIN_RANGE: f64 = 3.0;
+        let has_live_seek = is_playing_this
+            && self.live_seek_start.is_some()
+            && self.live_seek_far_edge >= LIVE_SEEK_MIN_RANGE;
+        let live_seek_extra = if has_live_seek { SEEK_ROW_HEIGHT } else { 0.0 };
         let panel_height = if current.is_some() {
-            118.0 + synopsis_extra_height + volume_extra
+            118.0 + synopsis_extra_height + volume_extra + live_seek_extra
         } else {
-            74.0 + volume_extra
+            74.0 + volume_extra + live_seek_extra
         };
         let panel_rect = egui::Rect::from_min_size(
             egui::pos2(rect.left() + margin, rect.bottom() - margin - panel_height),
@@ -1656,6 +1773,7 @@ impl TvhApp {
         let mut go_prev = false;
         let mut toggle_pause = false;
         let mut do_stop = false;
+        let mut live_seek_target: Option<f64> = None;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(panel_rect), |ui| {
             ui.add_space(8.0);
@@ -1695,6 +1813,29 @@ impl TvhApp {
                     }
                 });
             });
+
+            if has_live_seek {
+                if let Some(player) = &player_for_volume {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("⏱").color(TIMESHIFT_COLOR));
+                        // Jiná barva než u nahrávky (`draw_recording_overlay`)
+                        // - signalizuje, že tohle není pevná délka videa, ale
+                        // rozsah timeshift bufferu, který teď TVHeadend drží
+                        // (viz `live_seek_far_edge`).
+                        ui.visuals_mut().selection.bg_fill = TIMESHIFT_COLOR;
+                        live_seek_target = draw_seek_bar(
+                            ui,
+                            player,
+                            Some(self.live_seek_far_edge),
+                            self.live_seek_start.unwrap_or(0.0),
+                            panel_width - 130.0,
+                            true,
+                        );
+                    });
+                }
+            }
 
             if let Some(player) = &player_for_volume {
                 ui.add_space(2.0);
@@ -1794,6 +1935,11 @@ impl TvhApp {
         }
         if do_stop {
             self.stop_playback();
+        }
+        if let Some(target) = live_seek_target {
+            let ctx = ui.ctx().clone();
+            let absolute = self.live_seek_start.unwrap_or(0.0) + target;
+            self.handle_seek(&ctx, absolute);
         }
     }
 
@@ -1968,7 +2114,14 @@ impl TvhApp {
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         ui.add_space(10.0);
-                        seek_target = draw_seek_bar(ui, player, known_duration, panel_width - 110.0);
+                        seek_target = draw_seek_bar(
+                            ui,
+                            player,
+                            known_duration,
+                            0.0,
+                            panel_width - 110.0,
+                            false,
+                        );
                     });
                 }
             }
@@ -3475,11 +3628,19 @@ impl eframe::App for TvhApp {
                     if i.key_pressed(egui::Key::PageDown) {
                         self.select_relative_channel(1);
                     }
-                    // Seek ±10s - only meaningful for a recording (live
-                    // TV has no seekable position), so gated on
-                    // `playing_recording` rather than being global like
-                    // volume above.
-                    if self.playing_recording.is_some() {
+                    // Seek ±10s - relative, not absolute, so this works
+                    // for live TV too: mpv keeps a rolling network cache
+                    // even for a live stream (that's also why pausing and
+                    // resuming already picks up right where you paused -
+                    // TVHeadend's on-demand timeshift plus mpv's own
+                    // cache), and `seek_relative` moves within whatever's
+                    // cached and clamps harmlessly at either edge if
+                    // there's nothing there yet. No live-TV duration/seek
+                    // bar (there's no fixed end to show), but skipping a
+                    // few seconds forward/back - e.g. past part of an ad
+                    // break within what's already buffered - works the
+                    // same way it does for a recording.
+                    if self.playing_recording.is_some() || self.playing.is_some() {
                         if i.key_pressed(egui::Key::ArrowLeft) {
                             if let Some(player) = &self.player {
                                 player.seek_relative(-10.0);

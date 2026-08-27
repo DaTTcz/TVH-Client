@@ -209,6 +209,21 @@ impl MpvPlayer {
         self.mpv.get_property("cache-buffering-state").ok()
     }
 
+    /// Roughly how many more seconds of already-arrived data mpv has
+    /// cached *ahead of the current playback position* - `None` if
+    /// unknown. For live TV this is what defines how far forward you can
+    /// currently seek: while playing right at the live edge it stays
+    /// small (there's nothing "ahead" to have cached yet), but while
+    /// paused - or after seeking backward - it grows, because mpv/the OS
+    /// keep receiving and buffering data TVHeadend's own on-demand
+    /// timeshift is holding for us even though nothing's consuming it
+    /// yet. `TvhApp::live_seek_far_edge` turns this into a stable,
+    /// monotonically-growing seek-bar range (see its doc comment for why
+    /// a raw per-frame reading of this alone isn't quite enough).
+    pub fn demuxer_cache_duration(&self) -> Option<f64> {
+        self.mpv.get_property("demuxer-cache-duration").ok()
+    }
+
     /// Stop playback (blank frame, no channel loaded).
     pub fn stop(&self) -> Result<(), String> {
         self.mpv
