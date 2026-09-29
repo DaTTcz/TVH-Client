@@ -43,10 +43,11 @@ permissions:
 env:
   BIN_NAME: TVH-Client
   CARGO_TERM_COLOR: always
-  # Windows libmpv (dev balíček ze Sourceforge, stejný jako v README pro
-  # lokální build). Časem zastará - novější je na
-  # https://sourceforge.net/projects/mpv-player-windows/files/libmpv/
-  MPV_DEV_URL: https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-20260607-git-71ebd08.7z/download
+  # Windows libmpv-2.dll - bere se z vlastního releasu v0.1.0 (ten samý
+  # soubor, na který odkazuje README). SourceForge z GitHub runnerů
+  # stahování nespolehlivě odmítá. Novější mpv = nahrát novou DLL do
+  # nějakého releasu a změnit tuhle URL.
+  MPV_DLL_URL: https://github.com/DaTTcz/TVH-Client/releases/download/v0.1.0/libmpv-2.dll
 
 jobs:
   # ── Rychlá kontrola (každý push do master / PR) ──────────────────────────
@@ -106,12 +107,12 @@ jobs:
       - name: MSVC prostředí (dumpbin, lib.exe, rc.exe)
         uses: ilammy/msvc-dev-cmd@v1
       - uses: Swatinem/rust-cache@v2
-      - name: Stáhnout libmpv (dev balíček)
-        shell: pwsh
+      # make-lib.ps1 potřebuje jen DLL, mpv.lib si z ní vyrobí sám
+      - name: Stáhnout libmpv-2.dll
+        shell: bash
         run: |
-          Invoke-WebRequest -Uri $env:MPV_DEV_URL -OutFile mpv-dev.7z -UserAgent "Mozilla/5.0"
-          7z x mpv-dev.7z -ompv-dev
-          Copy-Item mpv-dev\libmpv-2.dll vendor\mpv\libmpv-2.dll -Force
+          curl -fL --retry 5 --retry-delay 10 -o vendor/mpv/libmpv-2.dll "$MPV_DLL_URL"
+          ls -la vendor/mpv/libmpv-2.dll
       - name: Vygenerovat mpv.lib
         working-directory: vendor/mpv
         shell: powershell

@@ -3,6 +3,11 @@
 //! `main.rs` only controls the *window*/titlebar icon while running,
 //! that's a separate thing). No-op on non-Windows targets.
 
+// `winresource` je v Cargo.toml jen `[target.'cfg(windows)'.build-dependencies]`,
+// takže na Linuxu vůbec neexistuje - kód, který ho používá, se musí
+// vynechat už při kompilaci (#[cfg]), ne jen runtime podmínkou, jinak
+// build.rs na Linuxu spadne na "cannot find crate `winresource`".
+#[cfg(windows)]
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
@@ -13,3 +18,6 @@ fn main() {
         );
     }
 }
+
+#[cfg(not(windows))]
+fn main() {}
