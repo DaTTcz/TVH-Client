@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Desktopový klient pro <a href="https://tvheadend.org/">TVHeadend</a> — Windows, napsaný v Rustu
+  Desktopový klient pro <a href="https://tvheadend.org/">TVHeadend</a> — Windows a Linux, napsaný v Rustu
   (<a href="https://github.com/emilk/egui">egui</a>/<a href="https://github.com/emilk/egui/tree/master/crates/eframe">eframe</a>).
 </p>
 
@@ -62,6 +62,23 @@ mít nainstalovaný Visual C++ Redistributable.
 Při prvním spuštění tě appka pošle do **Nastavení > Připojení** — zadej
 adresu serveru (např. `192.168.0.10:9981`, `http://` se doplní samo),
 případně jméno/heslo, a klikni Připojit.
+
+### Linux
+
+V [GitHub Releases](https://github.com/DaTTcz/TVH-Client/releases/latest) jsou:
+
+- `tvh-client_<verze>_amd64.deb` — Debian 12+, Ubuntu 24.04+, Linux Mint 22+
+  (`sudo apt install ./tvh-client_*_amd64.deb`)
+- `tvh-client-<verze>.x86_64.rpm` — openSUSE Tumbleweed/Slowroll, Fedora
+  (`sudo zypper install ./tvh-client-*.rpm` / `sudo dnf install ./tvh-client-*.rpm`)
+- `TVH-Client-x86_64-unknown-linux-gnu.tar.gz` — přenosná binárka pro
+  ostatní distribuce; potřebuje nainstalované mpv (`libmpv.so.2`)
+
+Video se přehrává přes systémové libmpv (mpv 0.35 a novější), balíčky si ho
+stáhnou jako závislost. Ubuntu 22.04 / Mint 21 mají jen starší libmpv1,
+tam to nepůjde. Nastavení se ukládá do `~/.config/tvh-client/`.
+Automatická aktualizace je zatím jen pro Windows, na Linuxu stáhni nový
+balíček z Releases.
 
 ## Licence
 

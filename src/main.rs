@@ -31,11 +31,22 @@ fn load_icon() -> eframe::egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    // `--version` vypíše verzi a skončí bez otevření okna. Používá to CI
+    // (.github/workflows/build.yml) k ověření, že se binárka na dané
+    // distribuci vůbec načte (glibc, libmpv) a hlásí verzi z Cargo.toml.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("TVH Client {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([600.0, 400.0])
             .with_title("TVH Client")
+            // Na Linuxu (hlavně Wayland/KDE) se podle app_id páruje okno s
+            // packaging/linux/tvh-client.desktop -> správná ikona v panelu.
+            .with_app_id("tvh-client")
             .with_icon(load_icon()),
         // Embedded mpv playback needs the glow (OpenGL) backend - it's how
         // we get access to the GL context/proc-address loader that mpv's

@@ -1,0 +1,309 @@
+name: Build
+
+# Tři úrovně podle toho, co workflow spustí (stejný princip jako eR Commander
+# a FFMPEG Master):
+#
+# - push do master / pull request -> jen rychlá kontrola "check": cargo check
+#   (Linux + Windows) a cargo test (Linux). Pár minut, nic se nevydává.
+#
+# - ruční spuštění (Actions -> Build -> Run workflow) -> check + plný build
+#   všech balíčků + test na distribucích, ale BEZ vydání releasu. Na
+#   vyzkoušení změn v buildu.
+#
+# - push tagu "v*" (např. v0.8.0) -> plný build + test na distribucích +
+#   GitHub Release. Release vznikne jen tehdy, když všechny testy projdou.
+#   Tag musí odpovídat verzi v Cargo.toml, jinak build skončí chybou
+#   (v0.7.0 vyšla s Cargo.toml 0.5.1 -> appka hlásila starou verzi a
+#   self-update jí pořád dokola nabízel "novou" 0.7.0).
+#
+# Soubory v releasu:
+#   TVH-Client.exe                               Windows (samo-aktualizace ho hledá PŘESNĚ pod tímhle jménem)
+#   libmpv-2.dll                                 Windows, patří vedle .exe
+#   TVH-Client-x86_64-pc-windows-msvc.zip        Windows, .exe + libmpv-2.dll v jednom
+#   TVH-Client-x86_64-unknown-linux-gnu.tar.gz   Linux přenosná binárka (potřebuje systémový libmpv)
+#   tvh-client_<verze>_amd64.deb                 Debian 12+ / Ubuntu 24.04+ / Mint 22+
+#   tvh-client-<verze>.x86_64.rpm                openSUSE / Fedora
+#
+# POZOR: názvy TVH-Client.exe a libmpv-2.dll neměnit - ASSET_NAME v
+# src/update.rs a už nainstalované verze appky podle nich hledají update.
+#
+# AppImage zatím není: TVH-Client linkuje libmpv, takže by AppImage musel
+# přibalit celé mpv + ffmpeg (desítky knihoven, ~100 MB). Případně později.
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: TVH-Client
+  CARGO_TERM_COLOR: always
+  # Windows libmpv (dev balíček ze Sourceforge, stejný jako v README pro
+  # lokální build). Časem zastará - novější je na
+  # https://sourceforge.net/projects/mpv-player-windows/files/libmpv/
+  MPV_DEV_URL: https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-20260607-git-71ebd08.7z/download
+
+jobs:
+  # ── Rychlá kontrola (každý push do master / PR) ──────────────────────────
+  check:
+    if: "!startsWith(github.ref, 'refs/tags/v')"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux build závislosti
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libmpv-dev
+      # build.rs (winresource) volá rc.exe už při cargo check
+      - name: MSVC prostředí
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      # cargo check nelinkuje, takže na Windows mpv.lib zatím není potřeba
+      - name: cargo check
+        run: cargo check --locked --all-targets
+      - name: cargo test
+        if: runner.os == 'Linux'
+        run: cargo test --locked
+
+  # ── Verze z Cargo.toml (+ kontrola proti tagu) ──────────────────────────
+  version:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          echo "Verze v Cargo.toml: $VERSION"
+          if [ -z "$VERSION" ]; then echo "::error::V Cargo.toml nebyla nalezena verze"; exit 1; fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} neodpovídá verzi v Cargo.toml (v${VERSION})"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # ── Windows ─────────────────────────────────────────────────────────────
+  build-windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: MSVC prostředí (dumpbin, lib.exe, rc.exe)
+        uses: ilammy/msvc-dev-cmd@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Stáhnout libmpv (dev balíček)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:MPV_DEV_URL -OutFile mpv-dev.7z -UserAgent "Mozilla/5.0"
+          7z x mpv-dev.7z -ompv-dev
+          Copy-Item mpv-dev\libmpv-2.dll vendor\mpv\libmpv-2.dll -Force
+      - name: Vygenerovat mpv.lib
+        working-directory: vendor/mpv
+        shell: powershell
+        run: ./make-lib.ps1
+      - name: Build
+        run: cargo build --release --locked
+      - name: Zabalit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/release/${BIN_NAME}.exe" dist/
+          cp vendor/mpv/libmpv-2.dll dist/
+          cd dist
+          7z a "${BIN_NAME}-x86_64-pc-windows-msvc.zip" "${BIN_NAME}.exe" libmpv-2.dll
+          ls -la
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  # ── Linux: build v Debianu 12 kvůli glibc + libmpv ──────────────────────
+  # Proč ne ubuntu-latest: binárka z glibc 2.39 se na starších distribucích
+  # nespustí ("GLIBC_2.xx not found"). Proč ne ubuntu:22.04 jako u eR
+  # Commanderu: má jen libmpv1 (mpv 0.34), my potřebujeme libmpv.so.2
+  # (mpv 0.35+). Debian 12 = glibc 2.36 + libmpv2 -> poběží na Debianu 12+,
+  # Ubuntu 24.04+, Mintu 22+, Fedoře, openSUSE, Archu...
+  build-linux:
+    needs: version
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Systémové balíčky
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git file build-essential pkg-config cmake \
+            libmpv-dev
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: Kontrola binárky
+        run: |
+          B="target/x86_64-unknown-linux-gnu/release/${BIN_NAME}"
+          file "$B"
+          ldd "$B" || true
+          OUT=$("$B" --version)
+          echo "$OUT"
+          [ "$OUT" = "TVH Client ${VERSION}" ] || { echo "::error::Binárka hlásí '$OUT', čekám verzi ${VERSION}"; exit 1; }
+          mkdir -p dist
+          cp "$B" dist/
+          chmod +x "dist/${BIN_NAME}"
+
+      - name: tar.gz (přenosná binárka)
+        run: tar -czf "${BIN_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C dist "${BIN_NAME}"
+
+      - name: .deb a .rpm (nfpm)
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' > /etc/apt/sources.list.d/goreleaser.list
+          apt-get update
+          apt-get install -y nfpm
+          nfpm package -f packaging/linux/nfpm.yaml -p deb -t "tvh-client_${VERSION}_amd64.deb"
+          nfpm package -f packaging/linux/nfpm.yaml -p rpm -t "tvh-client-${VERSION}.x86_64.rpm"
+          ls -la *.tar.gz *.deb *.rpm
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-tar
+          path: ${{ env.BIN_NAME }}-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-deb
+          path: tvh-client_*_amd64.deb
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-rpm
+          path: tvh-client-*.x86_64.rpm
+          if-no-files-found: error
+
+  # ── Test na distribucích ────────────────────────────────────────────────
+  # GUI se v CI spustit nedá, ale `--version` ověří to podstatné: že balíček
+  # jde nainstalovat (a stáhne si libmpv), dá program do PATH a binárka se
+  # na dané distribuci vůbec načte (glibc, libmpv.so.2).
+  test-linux:
+    needs: [version, build-linux]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian 12 (.deb)
+            image: debian:12
+            package: deb
+          - name: Ubuntu 24.04 (.deb)
+            image: ubuntu:24.04
+            package: deb
+          - name: Debian 13 (.deb)
+            image: debian:trixie
+            package: deb
+          - name: Fedora (.rpm)
+            image: fedora:latest
+            package: rpm
+          - name: openSUSE Tumbleweed (.rpm)
+            image: opensuse/tumbleweed
+            package: rpm
+          - name: Arch Linux (tar.gz)
+            image: archlinux:latest
+            package: none
+    name: Test ${{ matrix.name }}
+    container:
+      image: ${{ matrix.image }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: linux-*
+          path: pkg
+          merge-multiple: true
+      - name: Instalace balíčku
+        shell: bash
+        run: |
+          set -e
+          ls -la pkg
+          case "${{ matrix.package }}" in
+            deb)
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends ./pkg/*.deb ;;
+            rpm)
+              if command -v zypper >/dev/null; then
+                zypper --non-interactive install --allow-unsigned-rpm --no-recommends ./pkg/*.rpm
+              else
+                dnf install -y --setopt=install_weak_deps=False ./pkg/*.rpm
+              fi ;;
+            none)
+              # tar.gz neřeší závislosti - libmpv doinstalujeme ručně
+              pacman -Syu --noconfirm mpv ;;
+          esac
+      - name: Spuštění (--version)
+        shell: bash
+        run: |
+          set -u
+          failed=0
+          check() {
+            local label="$1"; shift
+            local out
+            out=$("$@" 2>&1); local rc=$?
+            echo "$label: $out"
+            if [ $rc -ne 0 ] || [ "$out" != "TVH Client ${VERSION}" ]; then
+              echo "::error::$label: spuštění selhalo (kód $rc): $out"
+              failed=1
+            fi
+          }
+          if [ "${{ matrix.package }}" != "none" ]; then
+            check "Nainstalovaný .${{ matrix.package }} (TVH-Client)" TVH-Client --version
+            check "Nainstalovaný .${{ matrix.package }} (tvh-client)" tvh-client --version
+            test -f /usr/share/applications/tvh-client.desktop || { echo "::error::Chybí .desktop soubor"; failed=1; }
+            test -f /usr/share/icons/hicolor/256x256/apps/tvh-client.png || { echo "::error::Chybí ikona"; failed=1; }
+          fi
+          mkdir -p tarbin && tar -xzf pkg/TVH-Client-x86_64-unknown-linux-gnu.tar.gz -C tarbin
+          check "tar.gz binárka" ./tarbin/TVH-Client --version
+          exit $failed
+
+  # ── Release (jen z tagu, jen když všechno prošlo) ────────────────────────
+  release:
+    needs: [build-windows, build-linux, test-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: ls -la artifacts
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/TVH-Client.exe
+            artifacts/libmpv-2.dll
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/*.deb
+            artifacts/*.rpm
+          generate_release_notes: true

@@ -1,0 +1,55 @@
+# Konfigurace pro nfpm (https://nfpm.goreleaser.com) - z ní se v CI
+# (.github/workflows/build.yml) staví .deb i .rpm. Verze se bere z
+# proměnné prostředí VERSION (= verze z Cargo.toml).
+#
+# Binárka se linkuje proti systémovému libmpv (libmpv.so.2 = mpv 0.35+),
+# proto ho balíčky vyžadují jako závislost. Debian 12+/Ubuntu 24.04+/
+# Mint 22+ mají balíček libmpv2; Ubuntu 22.04 / Mint 21 má jen starý
+# libmpv1 a tam .deb nepůjde nainstalovat.
+# Pro .rpm jsou závislosti zapsané přes soname, protože Fedora (mpv-libs)
+# a openSUSE (libmpv2) balíček pojmenovávají každá jinak.
+name: tvh-client
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: video
+priority: optional
+maintainer: DaTTcz <42189153+DaTTcz@users.noreply.github.com>
+description: Desktopový klient pro TVHeadend (Rust + egui) - živé TV, EPG a nahrávky.
+homepage: https://github.com/DaTTcz/TVH-Client
+license: PolyForm-Noncommercial-1.0.0
+
+contents:
+  - src: dist/TVH-Client
+    dst: /usr/bin/TVH-Client
+    file_info:
+      mode: 0755
+  - src: /usr/bin/TVH-Client
+    dst: /usr/bin/tvh-client
+    type: symlink
+  - src: packaging/linux/tvh-client.desktop
+    dst: /usr/share/applications/tvh-client.desktop
+  - src: assets/icon-32.png
+    dst: /usr/share/icons/hicolor/32x32/apps/tvh-client.png
+  - src: assets/icon-48.png
+    dst: /usr/share/icons/hicolor/48x48/apps/tvh-client.png
+  - src: assets/icon-64.png
+    dst: /usr/share/icons/hicolor/64x64/apps/tvh-client.png
+  - src: assets/icon-128.png
+    dst: /usr/share/icons/hicolor/128x128/apps/tvh-client.png
+  - src: assets/icon-256.png
+    dst: /usr/share/icons/hicolor/256x256/apps/tvh-client.png
+  - src: LICENSE
+    dst: /usr/share/doc/tvh-client/LICENSE
+
+overrides:
+  deb:
+    depends:
+      - libmpv2
+      - libegl1
+      - libxkbcommon0
+  rpm:
+    depends:
+      - libmpv.so.2()(64bit)
+      - libEGL.so.1()(64bit)
+      - libxkbcommon.so.0()(64bit)

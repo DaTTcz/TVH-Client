@@ -227,8 +227,8 @@ pub fn downloads_dir() -> PathBuf {
 }
 
 /// Opens `path` (a file or folder) in the OS file manager and, if it's a
-/// file, selects it - Windows-only for now, matching this project's
-/// Windows-only scope (see README).
+/// file, selects it. On Linux `xdg-open` can't select a file, so it just
+/// opens the containing folder.
 pub fn open_in_file_manager(path: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
@@ -239,7 +239,12 @@ pub fn open_in_file_manager(path: &std::path::Path) {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = path;
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
 }
 
@@ -257,7 +262,7 @@ pub fn play_url(url: &str) {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = url;
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
 }
 

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=TVH Client
+GenericName=TVHeadend klient
+Comment=Živé TV, EPG a nahrávky z TVHeadend serveru
+Exec=TVH-Client
+Icon=tvh-client
+Terminal=false
+Categories=AudioVideo;Video;TV;Player;
+Keywords=tv;tvheadend;epg;dvr;iptv;
+StartupWMClass=tvh-client

@@ -16,7 +16,7 @@
 //!
 //! Release, ze kterého se stahuje, musí obsahovat asset přesně
 //! pojmenovaný podle [`ASSET_NAME`] - o to se stará
-//! `.github/workflows/release.yml`.
+//! `.github/workflows/build.yml`.
 //!
 //! **Pozn.:** první verze tohohle mechanismu používala skrytý/odpojený
 //! (`CREATE_NO_WINDOW | DETACHED_PROCESS`) PowerShell skript - u Davida se
@@ -39,12 +39,13 @@
 //! i po neúspěchu jde zkusit aktualizaci znovu bez ručního zásahu.
 
 use serde::Deserialize;
+#[cfg(windows)]
 use std::process::Command;
 
 pub const REPO_OWNER: &str = "DaTTcz";
 pub const REPO_NAME: &str = "TVH-Client";
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Musí odpovídat názvu assetu nahrávaného v `.github/workflows/release.yml`.
+/// Musí odpovídat názvu assetu nahrávaného v `.github/workflows/build.yml`.
 pub const ASSET_NAME: &str = "TVH-Client.exe";
 
 #[derive(Debug, Clone)]
@@ -130,7 +131,11 @@ pub fn download_and_apply(download_url: &str) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = download_url;
-        return Err("Automatická aktualizace je zatím jen pro Windows.".to_string());
+        return Err(
+            "Automatická aktualizace je zatím jen pro Windows. Na Linuxu stáhni nový \
+             .deb/.rpm/.tar.gz z GitHub Releases."
+                .to_string(),
+        );
     }
 
     #[cfg(windows)]
