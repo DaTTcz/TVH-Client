@@ -43,7 +43,8 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([600.0, 400.0])
-            .with_title("TVH Client")
+            // Verze v titulku (z Cargo.toml) - na první pohled je vidět, co běží.
+            .with_title(format!("TVH Client {}", env!("CARGO_PKG_VERSION")))
             // Na Linuxu (hlavně Wayland/KDE) se podle app_id páruje okno s
             // packaging/linux/tvh-client.desktop -> správná ikona v panelu.
             .with_app_id("tvh-client")
